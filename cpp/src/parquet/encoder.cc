@@ -1002,7 +1002,7 @@ class ByteStreamSplitEncoder<FLBAType> : public ByteStreamSplitEncoderBase<FLBAT
 // ----------------------------------------------------------------------
 // ALP encoder (Adaptive Lossless floating-Point)
 
-// TODO(GH-48701): encode incrementally and sample once per column chunk.
+// TODO(GH-48701): encode incrementally.
 //
 // TODO(GH-48701): fall back to PLAIN where ALP does not pay off. msg_sp in the
 // ALP paper's datasets encodes to 113% of plain. FallbackToPlainEncoding() acts
@@ -1040,11 +1040,17 @@ class AlpEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
         std::shared_ptr<ResizableBuffer> compressed_buffer,
         ::arrow::AllocateResizableBuffer(max_comp_size, this->memory_pool()));
 
+    const std::span<const T> values{reinterpret_cast<const T*>(sink_.data()),
+                                    static_cast<size_t>(num_elements)};
+    if (!has_preset_ && !values.empty()) {
+      PARQUET_ASSIGN_OR_THROW(preset_,
+                              ::arrow::util::alp::AlpCodec<T>::MakePreset(values));
+      has_preset_ = true;
+    }
     PARQUET_ASSIGN_OR_THROW(
         const int64_t compressed_size,
         ::arrow::util::alp::AlpCodec<T>::Encode(
-            {reinterpret_cast<const T*>(sink_.data()), static_cast<size_t>(num_elements)},
-            kVectorSize,
+            values, preset_, kVectorSize,
             {compressed_buffer->mutable_data(), static_cast<size_t>(max_comp_size)}));
 
     PARQUET_THROW_NOT_OK(compressed_buffer->Resize(compressed_size));
@@ -1087,6 +1093,10 @@ class AlpEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 
  private:
   ::arrow::BufferBuilder sink_;
+  // Keep candidates across pages; empty pages must not seed the sample.
+  ::arrow::util::alp::AlpEncodingPreset preset_ =
+      ::arrow::util::alp::AlpEncodingPreset::MakeDefault();
+  bool has_preset_ = false;
 };
 
 // ----------------------------------------------------------------------
