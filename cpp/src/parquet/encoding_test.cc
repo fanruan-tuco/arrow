@@ -2997,6 +2997,51 @@ TYPED_TEST(TestAlpEncoding, ReusesEncoderAcrossFlushes) {
   }
 }
 
+TYPED_TEST(TestAlpEncoding, ReusesPresetAcrossPages) {
+  using T = typename TypeParam::c_type;
+  using Codec = ::arrow::util::alp::AlpCodec<T>;
+  constexpr auto kVectorSize = ::arrow::util::alp::AlpFormatConstants::kDefaultVectorSize;
+  const std::vector<T> first(1024, T(64));
+  ASSERT_OK_AND_ASSIGN(auto preset, Codec::MakePreset(first));
+  std::vector<T> decimals(1500);
+  for (size_t i = 0; i < decimals.size(); ++i) {
+    decimals[i] = static_cast<T>(100.0 + i * 0.01);
+  }
+  const std::vector<std::vector<T>> pages = {
+      first,
+      {},
+      decimals,
+      {-T(0), std::numeric_limits<T>::quiet_NaN(), std::numeric_limits<T>::infinity(),
+       std::numeric_limits<T>::lowest(), std::numeric_limits<T>::denorm_min()}};
+
+  for (bool initially_empty : {false, true}) {
+    ARROW_SCOPED_TRACE("initially_empty = ", initially_empty);
+    auto encoder = MakeTypedEncoder<TypeParam>(Encoding::ALP, false, this->descr_.get());
+    auto decoder = MakeTypedDecoder<TypeParam>(Encoding::ALP, this->descr_.get());
+    if (initially_empty) {
+      EXPECT_EQ(encoder->FlushValues()->size(), 7);
+    }
+    for (const auto& page : pages) {
+      encoder->Put(page.data(), static_cast<int>(page.size()));
+      auto encoded = encoder->FlushValues();
+      ASSERT_OK_AND_ASSIGN(auto capacity,
+                           Codec::GetMaxCompressedSize(page.size(), kVectorSize));
+      std::vector<uint8_t> expected(capacity);
+      ASSERT_OK_AND_ASSIGN(auto size, Codec::Encode(page, preset, kVectorSize, expected));
+      ASSERT_EQ(encoded->size(), size);
+      ASSERT_EQ(0, std::memcmp(encoded->data(), expected.data(), size));
+      decoder->SetData(static_cast<int>(page.size()), encoded->data(),
+                       static_cast<int>(encoded->size()));
+      std::vector<T> output(page.size());
+      ASSERT_EQ(decoder->Decode(output.data(), static_cast<int>(output.size())),
+                page.size());
+      if (!page.empty()) {
+        ASSERT_EQ(0, std::memcmp(page.data(), output.data(), page.size() * sizeof(T)));
+      }
+    }
+  }
+}
+
 TYPED_TEST(TestAlpEncoding, RoundTripWithRepeats) {
   ASSERT_NO_FATAL_FAILURE(this->Execute(100, 10));
 }
