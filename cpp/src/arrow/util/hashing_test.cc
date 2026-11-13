@@ -349,6 +349,47 @@ TEST(ScalarMemoTable, Float64) {
   }
 }
 
+TEST(ScalarMemoTable, Float64ResizeOutOfMemory) {
+  constexpr int64_t kMemoryLimit = 64 * 1024;
+  ProxyMemoryPool proxy(system_memory_pool());
+  CappedMemoryPool pool(&proxy, kMemoryLimit);
+  {
+    ScalarMemoTable<double> table(&pool, 0);
+    // The initial 32-slot table grows on its 16th distinct value.
+    for (int32_t i = 0; i < 15; ++i) {
+      AssertGetOrInsert(table, static_cast<double>(i), i);
+    }
+    // Occupy the remaining capacity so the next hash table allocation fails.
+    ASSERT_OK_AND_ASSIGN(auto blocker,
+                         AllocateBuffer(kMemoryLimit - proxy.bytes_allocated(), &pool));
+    const int64_t allocated = proxy.bytes_allocated();
+    int32_t index = -1;
+    ASSERT_RAISES(OutOfMemory, table.GetOrInsert(15.0, &index));
+    ASSERT_EQ(proxy.bytes_allocated(), allocated);
+    ASSERT_EQ(table.size(), 15);
+    ASSERT_EQ(index, -1);
+    AssertGet(table, 15.0, kKeyNotFound);
+    std::vector<double> values(table.size());
+    table.CopyValues(values.data());
+    for (int32_t i = 0; i < table.size(); ++i) {
+      ASSERT_EQ(values[i], static_cast<double>(i));
+      AssertGet(table, static_cast<double>(i), i);
+    }
+    ASSERT_RAISES(OutOfMemory, table.GetOrInsert(15.0, &index));
+    ASSERT_EQ(table.size(), 15);
+    blocker.reset();
+    for (int32_t i = 15; i < 256; ++i) {
+      AssertGetOrInsert(table, static_cast<double>(i), i);
+    }
+    values.resize(table.size());
+    table.CopyValues(values.data());
+    for (int32_t i = 0; i < table.size(); ++i) {
+      ASSERT_EQ(values[i], static_cast<double>(i));
+    }
+  }
+  ASSERT_EQ(proxy.bytes_allocated(), 0);
+}
+
 TEST(ScalarMemoTable, StressInt64) {
   std::default_random_engine gen(42);
   std::uniform_int_distribution<int64_t> value_dist(-50, 50);
@@ -474,6 +515,43 @@ TEST(BinaryMemoTable, Basics) {
     });
     EXPECT_THAT(actual, testing::ElementsAre(B, C, D, E, F, ""));
   }
+}
+
+TEST(BinaryMemoTable, ResizeOutOfMemory) {
+  constexpr int64_t kMemoryLimit = 64 * 1024;
+  ProxyMemoryPool proxy(system_memory_pool());
+  CappedMemoryPool pool(&proxy, kMemoryLimit);
+  {
+    BinaryMemoTable<BinaryBuilder> table(&pool);
+    for (int32_t i = 0; i < 15; ++i) {
+      AssertGetOrInsert(table, std::to_string(i), i);
+    }
+    const int64_t values_size = table.values_size();
+    ASSERT_OK_AND_ASSIGN(auto blocker,
+                         AllocateBuffer(kMemoryLimit - proxy.bytes_allocated(), &pool));
+    const int64_t allocated = proxy.bytes_allocated();
+    int32_t index = -1;
+    ASSERT_RAISES(OutOfMemory, table.GetOrInsert("15", &index));
+    ASSERT_EQ(proxy.bytes_allocated(), allocated);
+    ASSERT_EQ(table.size(), 15);
+    ASSERT_EQ(table.values_size(), values_size);
+    ASSERT_EQ(index, -1);
+    for (int32_t i = 0; i < 15; ++i) {
+      AssertGet(table, std::to_string(i), i);
+    }
+    AssertGet(table, "15", kKeyNotFound);
+    blocker.reset();
+    for (int32_t i = 15; i < 256; ++i) {
+      AssertGetOrInsert(table, std::to_string(i), i);
+    }
+    std::vector<std::string> values;
+    table.VisitValues(0, [&](std::string_view value) { values.emplace_back(value); });
+    ASSERT_EQ(values.size(), 256);
+    for (int32_t i = 0; i < 256; ++i) {
+      ASSERT_EQ(values[i], std::to_string(i));
+    }
+  }
+  ASSERT_EQ(proxy.bytes_allocated(), 0);
 }
 
 TEST(BinaryMemoTable, Stress) {
