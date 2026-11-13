@@ -241,7 +241,7 @@ class HashTable {
     operator bool() const { return h != kSentinel; }
   };
 
-  HashTable(MemoryPool* pool, uint64_t capacity) : entries_builder_(pool) {
+  HashTable(MemoryPool* pool, uint64_t capacity) : pool_(pool), entries_builder_(pool) {
     ARROW_DCHECK_NE(pool, nullptr);
     // Minimum of 32 elements
     capacity = std::max<uint64_t>(capacity, 32UL);
@@ -270,16 +270,26 @@ class HashTable {
   }
 
   Status Insert(Entry* entry, hash_t h, const Payload& payload) {
+    return Insert(entry, h, payload, [] { return Status::OK(); });
+  }
+
+  // Prepare the payload after growing, but before publishing the new entry.
+  template <typename PreparePayload>
+  Status Insert(Entry* entry, hash_t h, const Payload& payload,
+                PreparePayload&& prepare_payload) {
     // Ensure entry is empty before inserting
     assert(!*entry);
+    if (ARROW_PREDICT_FALSE(NeedUpsizing())) {
+      // A failed allocation must not change the entry or the table's size.
+      RETURN_NOT_OK(Upsize(capacity_ * kLoadFactor * 2));
+      auto p = Lookup<NoCompare>(h, entries_, capacity_mask_,
+                                 [](const Payload*) { return false; });
+      entry = &entries_[p.first];
+    }
+    RETURN_NOT_OK(prepare_payload());
     entry->h = FixHash(h);
     entry->payload = payload;
     ++size_;
-
-    if (ARROW_PREDICT_FALSE(NeedUpsizing())) {
-      // Resize less frequently since it is expensive
-      return Upsize(capacity_ * kLoadFactor * 2);
-    }
     return Status::OK();
   }
 
@@ -345,7 +355,7 @@ class HashTable {
 
   bool NeedUpsizing() const {
     // Keep the load factor <= 1/2
-    return size_ * kLoadFactor >= capacity_;
+    return (size_ + 1) * kLoadFactor >= capacity_;
   }
 
   Status UpsizeBuffer(uint64_t capacity) {
@@ -361,24 +371,26 @@ class HashTable {
     uint64_t new_mask = new_capacity - 1;
     assert((new_capacity & new_mask) == 0);  // it's a power of two
 
-    // Stash old entries and seal builder, effectively resetting the Buffer
-    const Entry* old_entries = entries_;
-    ARROW_ASSIGN_OR_RAISE(auto previous, entries_builder_.FinishWithLength(capacity_));
-    // Allocate new buffer
-    RETURN_NOT_OK(UpsizeBuffer(new_capacity));
+    // Keep the old buffer alive until allocation and rehashing both succeed.
+    TypedBufferBuilder<Entry> new_entries_builder(pool_);
+    RETURN_NOT_OK(new_entries_builder.Resize(new_capacity));
+    Entry* new_entries = new_entries_builder.mutable_data();
+    memset(static_cast<void*>(new_entries), 0, new_capacity * sizeof(Entry));
 
     for (uint64_t i = 0; i < capacity_; i++) {
-      const auto& entry = old_entries[i];
+      const auto& entry = entries_[i];
       if (entry) {
         // Dummy compare function will not be called
-        auto p = Lookup<NoCompare>(entry.h, entries_, new_mask,
+        auto p = Lookup<NoCompare>(entry.h, new_entries, new_mask,
                                    [](const Payload*) { return false; });
         // Lookup<NoCompare> (and CompareEntry<NoCompare>) ensure that an
         // empty slots is always returned
         assert(!p.second);
-        entries_[p.first] = entry;
+        new_entries[p.first] = entry;
       }
     }
+    entries_builder_ = std::move(new_entries_builder);
+    entries_ = entries_builder_.mutable_data();
     capacity_ = new_capacity;
     capacity_mask_ = new_mask;
 
@@ -393,6 +405,7 @@ class HashTable {
   // The number of used slots in the hash table array.
   uint64_t size_;
 
+  MemoryPool* pool_;
   Entry* entries_;
   TypedBufferBuilder<Entry> entries_builder_;
 };
@@ -697,11 +710,11 @@ class BinaryMemoTable : public MemoTable {
       on_found(memo_index);
     } else {
       memo_index = size();
-      // Insert string value
-      RETURN_NOT_OK(binary_builder_.Append(static_cast<const char*>(data), length));
-      // Insert hash entry
+      // Do not append an unindexed string if hash table growth fails.
       RETURN_NOT_OK(
-          hash_table_.Insert(const_cast<HashTableEntry*>(p.first), h, {memo_index}));
+          hash_table_.Insert(const_cast<HashTableEntry*>(p.first), h, {memo_index}, [&] {
+            return binary_builder_.Append(static_cast<const char*>(data), length);
+          }));
 
       on_not_found(memo_index);
     }
